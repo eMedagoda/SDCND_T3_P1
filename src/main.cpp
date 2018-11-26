@@ -8,6 +8,7 @@
 #include "Eigen-3.3/Eigen/Core"
 #include "Eigen-3.3/Eigen/QR"
 #include "json.hpp"
+#include "spline.h"
 
 using namespace std;
 
@@ -18,6 +19,7 @@ using json = nlohmann::json;
 constexpr double pi() { return M_PI; }
 double deg2rad(double x) { return x * pi() / 180; }
 double rad2deg(double x) { return x * 180 / pi(); }
+double ms2mph(double x) { return x * 2.23694; }
 
 // Checks if the SocketIO event has JSON data.
 // If there is data the JSON object in string format will be returned,
@@ -163,6 +165,40 @@ vector<double> getXY(double s, double d, const vector<double> &maps_s, const vec
 
 }
 
+// Calculate cost of each lane
+double calculatecost(double delta_s, double delta_v)
+{    
+    const double SCALE_DELTA_S = 10.0; // scale factor on position cost
+    const double SIGMA_S = 40.0; // position cost 1-sigma
+    const double SCALE_DELTA_V = 20.0; // scale factor on velocity cost
+    
+    // initialise position cost
+    double cost_s = 1.0;
+    
+    // initialise speed cost
+    double cost_v = 1.0;
+    
+    // set velocity cost exponent gain
+    double k = 0.1;
+    
+    // if surrounding car is within 40 metres
+    if (abs(delta_s) <= SIGMA_S)
+    {    
+        // position cost
+        cost_s = (SCALE_DELTA_S/(SIGMA_S * sqrt(2.0 * pi()))) * exp(-(delta_s * delta_s)/(2.0 * SIGMA_S * SIGMA_S));
+        
+        if (delta_s <= -20.0) // if the position difference is less than than 20 metres
+        {
+            k *= -1.0; // consider the vehicle behind
+        }
+            
+        // speed cost
+        cost_v = SCALE_DELTA_V/(1.0 + exp(k * delta_v));    
+    }
+    
+    return (cost_s + cost_v);
+}
+
 int main() {
   uWS::Hub h;
 
@@ -200,8 +236,17 @@ int main() {
   	map_waypoints_dy.push_back(d_y);
   }
 
-  h.onMessage([&map_waypoints_x,&map_waypoints_y,&map_waypoints_s,&map_waypoints_dx,&map_waypoints_dy](uWS::WebSocket<uWS::SERVER> ws, char *data, size_t length,
-                     uWS::OpCode opCode) {
+  // Car's lane. Starting at middle lane.
+  int lane = 1;
+
+  // Reference velocity.
+  double ref_vel = 0.0; // mph
+
+  h.onMessage([&ref_vel, &lane, &map_waypoints_x,&map_waypoints_y,&map_waypoints_s,&map_waypoints_dx,&map_waypoints_dy]
+    (uWS::WebSocket<uWS::SERVER> ws, char *data, size_t length, uWS::OpCode opCode) {
+
+
+
     // "42" at the start of the message means there's a websocket message event.
     // The 4 signifies a websocket message
     // The 2 signifies a websocket event
@@ -237,13 +282,319 @@ int main() {
           	// Sensor Fusion Data, a list of all other cars on the same side of the road.
           	auto sensor_fusion = j[1]["sensor_fusion"];
 
-          	json msgJson;
+            //###########################################################################
+            
+            // Provided previous path point size
+            int prev_size = previous_path_x.size();
+
+            if (prev_size > 0) 
+            {
+                car_s = end_path_s;
+            }
+
+            // SENSOR FUSION AND COSTING
+            
+            bool car_ahead = false;
+            bool car_left = false;
+            bool car_right = false;
+            
+            const double MAX_SPEED = 49.5;
+            const double MIN_SPEED = 0.1;
+            const double MAX_DELTA_SPEED = 0.5;
+            const double MIN_DELTA_SPEED = 0.5; // allow for hard braking is vehicle ahead slows rapidly    
+            const double MIN_CLOSING_DISTANCE = 30.0; // safe following distance behind vehicle ahead
+            
+            double car_ahead_speed = MAX_SPEED; // initial car ahead speed to speed limit
+            double closing_distance = MIN_CLOSING_DISTANCE; // minimum distance to car ahead
+            
+            // initialise costs for each lane (preference staying in lane)
+            double cost_left = 10000.0;
+            double cost_ahead = 1.0; 
+            double cost_right = 10000.0;
+            double cost_left_free = 1.0;
+            double cost_ahead_free = 1.0;
+            double cost_right_free = 1.0;
+          
+            for ( int i = 0; i < sensor_fusion.size(); i++ ) 
+            {
+                int vehicle_id = sensor_fusion[i][0]; // vehicle id
+                double d = sensor_fusion[i][6]; // other vehicle lateral position               
+               
+                // initialise car lane
+                int car_lane = -1;
+                
+                if ( d > 0.0 && d < 4.0 ) // check if other car is in left lane
+                {
+                    car_lane = 0;               
+                } 
+                else if ( d > 4.0 && d < 8.0 ) // check if other car is in centre lane 
+                {
+                    car_lane = 1;
+                } 
+                else if ( d > 8.0 && d < 12.0 ) // check if the other car is in the right lane
+                {
+                    car_lane = 2;
+                }
+                
+                // determine other car speed
+                double vx = sensor_fusion[i][3];
+                double vy = sensor_fusion[i][4];
+                double check_speed = distance(0.0, 0.0, vx, vy);
+                double check_car_s = sensor_fusion[i][5]; // other cars forward path position
+                
+                // position difference
+                double delta_s = check_car_s - car_s;
+                
+                // speed difference
+                double delta_v = check_speed - car_speed;
+                                
+                // predict other position at the end of the previous trajectory
+                check_car_s += ((double)prev_size*0.02*check_speed);
+
+                if ( car_lane == lane ) // if the other car is in ego vehicle lane
+                {                    
+                    // calculate cost of staying in current lane
+                    cost_ahead *= calculatecost(delta_s, delta_v);
+                    
+                    // if the other car is ahead of the ego vehicle by more than 30.0 metres
+                    if ((check_car_s > car_s) && (fabs(check_car_s - car_s) < 30.0)) 
+                    {
+                        car_ahead = true; // other car ahead of ego vehicle
+                        cost_ahead_free = 1.0e5; // staying in lane becomes costly
+                        
+                        car_ahead_speed = ms2mph(check_speed); // set car ahead speed
+                        closing_distance = fabs(check_car_s - car_s); // set closing distance to car ahead                        
+                    }
+                } 
+                else if ((car_lane - lane) == -1 ) // the other car is left of the ego vehicle
+                {                    
+                    // calculate cost of merging left
+                    cost_left *= calculatecost(delta_s, delta_v);
+                    
+                    // if the other car is within 30.0 metres of the ego vehicle (fore and aft)
+                    if (((car_s - 30.0) < check_car_s) && ((car_s + 40.0) > check_car_s))
+                    {
+                        car_left = true; // left lane occupied
+                        cost_left_free = 1.0e6; // merge left very costly
+                    }
+                } 
+                else if ( car_lane - lane == 1 ) // the other car is right of the ego vehicle
+                {
+                    // calculate the cost of merging right
+                    cost_right *= calculatecost(delta_s, delta_v);
+                    
+                    // if the other car is within 30.0 metres of the ego vehicle (fore and aft)
+                    if (((car_s - 30.0) < check_car_s) && ((car_s + 40.0) > check_car_s))
+                    {
+                        car_right = true; // right lane is occupied
+                        cost_right_free = 1.0e6; // merge right very costly
+                    }
+                }
+            }
+            
+            // if ego vehicle is in the left most lane
+            if(lane <= 0)
+            {
+                cost_left_free *= 1.0e8; // merging left is extremely costly
+            }
+            else if (lane >= 2) // if ego vehicle is in the right most lane
+            {
+                cost_right_free *= 1.0e8; // merging right is extremely costly
+            }              
+            
+            cout << "Cost L: " << cost_left_free * cost_left << ", Cost A: " << cost_ahead_free * cost_ahead << ", Cost_R: " << cost_right_free * cost_right << endl;
+           
+            double best_cost = 1.0e16;
+            int opt_traj = 10;
+            vector<double> cost_vec = {cost_left_free * cost_left, cost_ahead_free * cost_ahead, cost_right_free * cost_right};
+            
+            // determine lowest cost action
+            for (int i = 0; i < cost_vec.size(); i++)
+            {                
+                if (cost_vec[i] < best_cost)
+                {
+                    best_cost = cost_vec[i];                
+                    
+                    opt_traj = i;                   
+                }
+            }
+            
+            cout << "Best Cost: " << best_cost << ", Opt Traj: " << opt_traj << endl;
+            
+            // BEHAVIOUR PLANNING
+           
+            if (car_ahead) // if other car is detected ahead
+            { 
+                cout << "CAR AHEAD" << endl;
+                
+                if (opt_traj == 0) // if a left lane is available and is free
+                {
+                    lane--; // merge left
+                    cout << "MERGE LEFT" << endl;
+                } 
+                else if (opt_traj == 2) // if a right lane is available and is free
+                {
+                    lane++; // merge right.
+                    cout << "MERGE RIGHT" << endl;
+                } 
+                else 
+                {                         
+                    double range = closing_distance;
+                    
+                    if (closing_distance > MIN_CLOSING_DISTANCE)
+                    {
+                        closing_distance = MIN_CLOSING_DISTANCE;
+                    }
+                    
+                    double closing_rate = (exp(0.1 * (MIN_CLOSING_DISTANCE - closing_distance)) - 1.0) + (car_speed - car_ahead_speed) * 0.02; // calculate closing rate 
+                    
+                    if (closing_rate > MIN_DELTA_SPEED)
+                    {
+                        closing_rate = MIN_DELTA_SPEED;
+                    }
+                    
+                    cout << "KEEP LANE, ADJUST SPEED TO: " << car_ahead_speed << ", CLOSING RATE: " << closing_rate << ", RANGE: " << range << endl;
+                    
+                    ref_vel -= closing_rate; // slow down to speed of other vehicle ahead
+                    
+                }
+            } 
+            else 
+            {
+              if ( ref_vel < MAX_SPEED ) 
+              {
+                ref_vel += MAX_DELTA_SPEED; // if no cars ahead, full acceleration to max speed
+              }
+            }
+                           
+            // speed limiter
+            if ( ref_vel > MAX_SPEED ) 
+            {
+                ref_vel = MAX_SPEED;
+            } 
+            else if ( ref_vel < MIN_SPEED ) 
+            {
+                ref_vel = MIN_SPEED;
+            }
+
+            // TRAJECTORY GENERATION
+            
+          	vector<double> ptsx;
+            vector<double> ptsy;
+
+            double ref_x = car_x;
+            double ref_y = car_y;
+            double ref_yaw = deg2rad(car_yaw);
+
+            if (prev_size < 2) // if no previous points present
+            {
+                double prev_car_x = car_x - cos(car_yaw);
+                double prev_car_y = car_y - sin(car_yaw);
+
+                ptsx.push_back(prev_car_x);
+                ptsx.push_back(car_x);
+
+                ptsy.push_back(prev_car_y);
+                ptsy.push_back(car_y);
+            } 
+            else 
+            {
+                // use the last points of the previous trajectory
+                ref_x = previous_path_x[prev_size - 1];
+                ref_y = previous_path_y[prev_size - 1];
+
+                double ref_x_prev = previous_path_x[prev_size - 2];
+                double ref_y_prev = previous_path_y[prev_size - 2];
+                ref_yaw = atan2(ref_y-ref_y_prev, ref_x-ref_x_prev);
+
+                ptsx.push_back(ref_x_prev);
+                ptsx.push_back(ref_x);
+
+                ptsy.push_back(ref_y_prev);
+                ptsy.push_back(ref_y);
+            }
+
+            // points on anchor path spaced at 30.0 metres intervals ahead of ego vehicle position 
+            vector<double> next_wp0 = getXY(car_s + 30.0, 2 + 4 * lane, map_waypoints_s, map_waypoints_x, map_waypoints_y);
+            vector<double> next_wp1 = getXY(car_s + 60.0, 2 + 4 * lane, map_waypoints_s, map_waypoints_x, map_waypoints_y);
+            vector<double> next_wp2 = getXY(car_s + 90.0, 2 + 4 * lane, map_waypoints_s, map_waypoints_x, map_waypoints_y);
+
+            ptsx.push_back(next_wp0[0]);
+            ptsx.push_back(next_wp1[0]);
+            ptsx.push_back(next_wp2[0]);
+
+            ptsy.push_back(next_wp0[1]);
+            ptsy.push_back(next_wp1[1]);
+            ptsy.push_back(next_wp2[1]);
+
+            // transfor points into local frame
+            for ( int i = 0; i < ptsx.size(); i++ ) 
+            {
+                // shift to path coordinates (remove global reference)
+                double shift_x = ptsx[i] - ref_x;
+                double shift_y = ptsy[i] - ref_y;
+
+                // transform path into vehicle body frame
+                ptsx[i] = shift_x * cos(0.0 - ref_yaw) - shift_y * sin(0.0 - ref_yaw);
+                ptsy[i] = shift_x * sin(0.0 - ref_yaw) + shift_y * cos(0.0 - ref_yaw);
+            }
+
+            // build spline path
+            tk::spline s;
+            
+            // set points to the spline (in path frame)
+            s.set_points(ptsx, ptsy, true); 
 
           	vector<double> next_x_vals;
           	vector<double> next_y_vals;
+            
+            // add points from previous path to current trajectory
+            for ( int i = 0; i < prev_size; i++ ) 
+            {
+                next_x_vals.push_back(previous_path_x[i]);
+                next_y_vals.push_back(previous_path_y[i]);
+            }
 
+            // determine how to separate the points so that the reference speed is maintained
+            double target_x = 30.0;
+            double target_y = s(target_x);
+            double target_dist = distance(0.0, 0.0, target_x, target_y);
 
-          	// TODO: define a path made up of (x,y) points that the car will visit sequentially every .02 seconds
+            double x_add_on = 0;
+
+            // add remaining points onto spline to complete the full path
+            for( int i = 1; i < 50 - prev_size; i++ ) 
+            {
+               
+                // determine desired point spacing
+                double N = target_dist/(0.02*ref_vel/2.24);
+                
+                // add space x values
+                double x_point = x_add_on + target_x/N;
+                double y_point = s(x_point);
+
+                x_add_on = x_point; // shift point for next iteration
+
+                double x_ref = x_point;
+                double y_ref = y_point;
+
+                // transform back to global coordinates
+                x_point = x_ref * cos(ref_yaw) - y_ref * sin(ref_yaw);
+                y_point = x_ref * sin(ref_yaw) + y_ref * cos(ref_yaw);
+
+                // add origin
+                x_point += ref_x;
+                y_point += ref_y;
+
+                // add point to path list
+                next_x_vals.push_back(x_point);
+                next_y_vals.push_back(y_point);
+            }
+            
+            //#############################################################################
+            
+            json msgJson;
+
           	msgJson["next_x"] = next_x_vals;
           	msgJson["next_y"] = next_y_vals;
 
